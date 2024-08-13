@@ -1,5 +1,5 @@
 # 将微信读书划线和笔记同步到Notion
-
+![扫码_搜索联合传播样式-标准色版](https://github.com/chaixuqing/weread2notion/blob/main/OUT_FOLDER/weread.svg)
 
 本项目通过Github Action每天定时同步微信读书划线到Notion。
 
