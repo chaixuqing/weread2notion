@@ -27,6 +27,14 @@ from utils import (
     get_title,
     get_url,
 )
+import asyncio
+import aiohttp
+from typing import Optional, Dict, List, Tuple, Any
+from functools import partial
+import concurrent.futures
+from notion_client import AsyncClient
+from functools import wraps
+
 load_dotenv()
 WEREAD_URL = "https://weread.qq.com/"
 WEREAD_NOTEBOOKS_URL = "https://i.weread.qq.com/user/notebooks"
@@ -348,6 +356,12 @@ def download_image(url, save_dir="cover"):
     return save_path
 
 
+async def download_image_async(url, save_dir="cover"):
+    """基于线程池异步下载图片"""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, download_image, url, save_dir)
+
+
 def try_get_cloud_cookie(url, id, password):
     if url.endswith("/"):
         url = url[:-1]
@@ -398,62 +412,252 @@ def extract_page_id():
     else:
         raise Exception(f"获取NotionID失败，请检查输入的Url是否正确")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    options = parser.parse_args()
-    weread_cookie = get_cookie()
-    database_id = extract_page_id()
-    notion_token = os.getenv("NOTION_TOKEN")
-    session = requests.Session()
-    session.cookies = parse_cookie_string(weread_cookie)
-    client = Client(auth=notion_token, log_level=logging.ERROR)
-    session.get(WEREAD_URL)
-    latest_sort = get_sort()
-    books = get_notebooklist()
-    if books != None:
-        for index, book in enumerate(books):
-            sort = book["sort"]
-            if sort <= latest_sort:
-                continue
-            book = book.get("book")
-            title = book.get("title")
-            cover = book.get("cover").replace("/s_", "/t7_")
-            # print(cover)
-            # if book.get("author") == "公众号" and book.get("cover").endswith("/0"):
-            #     cover += ".jpg"
-            # if cover.startswith("http") and not cover.endswith(".jpg"):
-            #     path = download_image(cover)
-            #     cover = f"https://raw.githubusercontent.com/{os.getenv('REPOSITORY')}/{os.getenv('REF').split('/')[-1]}/{path}"
-            bookId = book.get("bookId")
-            author = book.get("author")
-            categories = book.get("categories")
-            if categories != None:
-                categories = [x["title"] for x in categories]
-            print(f"正在同步 {title} ,一共{len(books)}本，当前是第{index+1}本。")
-            check(bookId)
-            isbn, rating = get_bookinfo(bookId)
-            id = insert_to_notion(
-                title, bookId, cover, sort, author, isbn, rating, categories
-            )
-            chapter = get_chapter_info(bookId)
-            bookmark_list = get_bookmark_list(bookId)
-            summary, reviews = get_review_list(bookId)
-            bookmark_list.extend(reviews)
-            bookmark_list = sorted(
-                bookmark_list,
+
+def retry_async(
+    retries: int = 3,
+    delay: float = 1.0,
+    backoff: float = 2.0
+):
+    """Retry decorator for async functions"""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            retry_count = 0
+            current_delay = delay
+            
+            while retry_count < retries:
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    retry_count += 1
+                    if retry_count == retries:
+                        raise e
+                    
+                    await asyncio.sleep(current_delay)
+                    current_delay *= backoff
+                    
+        return wrapper
+    return decorator
+
+
+class WeReadClient:
+    """WeRead API client with async support and performance optimizations"""
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        notion_client: AsyncClient,
+        cache: Cache,
+        rate_limiter: RateLimiter,
+        max_concurrent_requests: int = 10,
+        request_timeout: int = 30
+    ):
+        self.session = session
+        self.notion_client = notion_client
+        self.cache = cache
+        self.rate_limiter = rate_limiter
+        self.semaphore = asyncio.Semaphore(max_concurrent_requests)
+        self.timeout = aiohttp.ClientTimeout(total=request_timeout)
+        self.performance_monitor = PerformanceMonitor()
+        
+    @retry_async(retries=3)
+    async def make_request(
+        self,
+        method: str,
+        url: str,
+        **kwargs
+    ) -> Optional[Dict]:
+        """Make HTTP request with retry, rate limiting and monitoring"""
+        start_time = time.monotonic()
+        
+        try:
+            async with self.semaphore:
+                await self.rate_limiter.acquire()
+                async with self.session.request(
+                    method,
+                    url,
+                    timeout=self.timeout,
+                    **kwargs
+                ) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    
+                    # Track request performance
+                    duration = time.monotonic() - start_time
+                    await self.performance_monitor.track(
+                        f"{method}_{url}",
+                        duration
+                    )
+                    
+                    return data
+        except Exception as e:
+            print(f"Request error: {e}")
+            raise
+
+    async def get_bookmark_list(
+        self, 
+        book_id: str,
+        use_cache: bool = True
+    ) -> Optional[List[Dict]]:
+        """Fetch bookmark list with caching"""
+        cache_key = f"bookmarks:{book_id}"
+        
+        if use_cache:
+            cached = await self.cache.get(cache_key)
+            if cached:
+                return cached
+                
+        params = {'bookId': book_id}
+        data = await self.make_request(
+            'GET',
+            WEREAD_BOOKMARKLIST_URL,
+            params=params
+        )
+        
+        if data:
+            updated = data.get('updated', [])
+            result = sorted(
+                updated,
                 key=lambda x: (
-                    x.get("chapterUid", 1),
-                    (
-                        0
-                        if (
-                            x.get("range", "") == ""
-                            or x.get("range").split("-")[0] == ""
-                        )
-                        else int(x.get("range").split("-")[0])
-                    ),
-                ),
+                    x.get('chapterUid', 1),
+                    int(x.get('range', '0-0').split('-')[0])
+                )
             )
-            children, grandchild = get_children(chapter, summary, bookmark_list)
-            results = add_children(id, children)
-            if len(grandchild) > 0 and results != None:
-                add_grandchild(grandchild, results)
+            
+            if use_cache:
+                await self.cache.set(cache_key, result)
+            return result
+        return None
+
+    async def process_books_parallel(
+        self,
+        books: List[Dict],
+        database_id: str,
+        latest_sort: int,
+        batch_size: int = 5
+    ):
+        """Process multiple books in parallel with batching"""
+        total_books = len(books)
+        processed = 0
+        
+        for i in range(0, total_books, batch_size):
+            batch = books[i:i + batch_size]
+            results = await process_book_batch(
+                self,
+                batch,
+                database_id,
+                latest_sort,
+                batch_size
+            )
+            
+            processed += len(batch)
+            print(f"Processed {processed}/{total_books} books")
+            
+            # Small delay between batches to prevent overload
+            if i + batch_size < total_books:
+                await asyncio.sleep(1)
+
+    async def get_book_info(
+        self,
+        book_id: str,
+        use_cache: bool = True
+    ) -> Tuple[str, float]:
+        """Fetch book info with caching"""
+        cache_key = f"book_info:{book_id}"
+        
+        if use_cache:
+            cached = await self.cache.get(cache_key)
+            if cached:
+                return cached
+                
+        params = {'bookId': book_id}
+        data = await self.make_request(
+            'GET',
+            WEREAD_BOOK_INFO,
+            params=params
+        )
+        
+        if data:
+            result = (
+                data.get('isbn', ''),
+                data.get('newRating', 0) / 1000
+            )
+            if use_cache:
+                await self.cache.set(cache_key, result)
+            return result
+        return '', 0
+
+async def async_check(bookId, client, database_id):
+    """异步检查并删除已插入的记录，避免阻塞"""
+    await asyncio.sleep(0.3)
+    filter = {"property": "BookId", "rich_text": {"equals": bookId}}
+    response = await client.databases.query(database_id=database_id, filter=filter)
+    for result in response["results"]:
+        await asyncio.sleep(0.3)
+        await client.blocks.delete(block_id=result["id"])
+
+async def main():
+    """Enhanced main async function with better error handling and monitoring"""
+    load_dotenv()
+    
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+    
+    try:
+        # Initialize components
+        cookie = get_cookie()
+        database_id = extract_page_id()
+        notion_token = os.getenv('NOTION_TOKEN')
+        redis_url = os.getenv('REDIS_URL')
+        
+        # Initialize cache and rate limiter
+        cache = Cache(redis_url=redis_url)
+        rate_limiter = RateLimiter(rate=5, capacity=10)
+        
+        # Connection pool settings
+        conn = aiohttp.TCPConnector(
+            limit=10,
+            ttl_dns_cache=300,
+            use_dns_cache=True
+        )
+        
+        async with aiohttp.ClientSession(
+            cookies=parse_cookie_string(cookie),
+            connector=conn,
+            timeout=aiohttp.ClientTimeout(total=300)
+        ) as session:
+            notion_client = AsyncClient(auth=notion_token)
+            client = WeReadClient(
+                session=session,
+                notion_client=notion_client,
+                cache=cache,
+                rate_limiter=rate_limiter
+            )
+            
+            # Get latest sort and book list
+            latest_sort = await client.get_sort(database_id)
+            books = await client.get_notebook_list()
+            
+            if not books:
+                logger.error("Failed to fetch books")
+                return
+                
+            # Process books in parallel batches
+            await client.process_books_parallel(
+                books=books,
+                database_id=database_id,
+                latest_sort=latest_sort
+            )
+            
+    except Exception as e:
+        logger.error(f"Error in main: {e}", exc_info=True)
+    finally:
+        # Cleanup
+        if 'cache' in locals():
+            await cache.clear()
+            
+if __name__ == '__main__':
+    asyncio.run(main())
